@@ -117,8 +117,10 @@ impl Rasterizer {
         if max_col < 0 {
             return Ok(None);
         }
-        // Glyphs are clipped to their terminal cell, so the changed-cell
-        // bounding box is sufficient and exactly reproducible.
+        // Glyphs are clipped to their terminal cell, so a cell's pixels depend
+        // on that cell alone: redrawing only the changed cells reproduces a
+        // full render exactly. The changed-cell bounding box is still reported
+        // as the damage.
         let col_start = min_col;
         let col_end = max_col + 1;
         let row_start = min_row;
@@ -135,11 +137,44 @@ impl Rasterizer {
         if x1 <= x0 || y1 <= y0 {
             return Ok(None);
         }
-        fill_rect(pixels, width, height, x0, y0, x1 - x0, y1 - y0, [0; 3], 255);
-        self.draw_region(
-            pixels, width, height, cells, cols, rows, 255, scale, col_start, col_end, row_start,
-            row_end,
-        );
+        for row in row_start..row_end {
+            for col in col_start..col_end {
+                let index = row as usize * cols as usize + col as usize;
+                let cell = cells[index];
+                if cell == previous[index] {
+                    continue;
+                }
+                let x = origin_x + col * cell_width;
+                let y = origin_y + row * cell_height;
+                // A non-black background is an opaque fill of the whole cell;
+                // only a black one needs the cell cleared first.
+                if cell.bg == [0; 3] {
+                    fill_rect(
+                        pixels,
+                        width,
+                        height,
+                        x,
+                        y,
+                        cell_width,
+                        cell_height,
+                        [0; 3],
+                        255,
+                    );
+                }
+                self.draw_cell(
+                    pixels,
+                    width,
+                    height,
+                    cell,
+                    x,
+                    y,
+                    cell_width,
+                    cell_height,
+                    255,
+                    scale,
+                );
+            }
+        }
         Ok(Some(Damage {
             x: x0,
             y: y0,
@@ -174,64 +209,95 @@ impl Rasterizer {
                 let cell = cells[row as usize * cols as usize + col as usize];
                 let x = origin_x + col * cell_width;
                 let y = origin_y + row * cell_height;
-                if cell.bg != [0; 3] {
-                    fill_rect(
-                        pixels,
-                        width,
-                        height,
-                        x,
-                        y,
-                        cell_width,
-                        cell_height,
-                        cell.bg,
-                        alpha,
-                    );
-                }
-                if cell.ch == ' ' || cell.ch == '\0' {
-                    continue;
-                }
-                if let Some(block) = block_element(cell.ch) {
-                    draw_block(
-                        pixels,
-                        width,
-                        height,
-                        x,
-                        y,
-                        cell_width,
-                        cell_height,
-                        block,
-                        cell.fg,
-                        cell.bg,
-                        alpha,
-                    );
-                    continue;
-                }
-                let key = (cell.ch, scale);
-                let font = &self.font;
-                let glyph = self.glyphs.entry(key).or_insert_with(|| {
-                    let (metrics, coverage) = font.rasterize(cell.ch, FONT_PX * scale as f32);
-                    Glyph { metrics, coverage }
-                });
-                let glyph_x = x + glyph.metrics.xmin;
-                let baseline = y + self.ascent * scale;
-                let glyph_y = baseline - glyph.metrics.ymin - glyph.metrics.height as i32;
-                draw_glyph(
+                self.draw_cell(
                     pixels,
                     width,
                     height,
-                    glyph_x,
-                    glyph_y,
+                    cell,
                     x,
                     y,
                     cell_width,
                     cell_height,
-                    glyph,
-                    cell.fg,
-                    cell.bg,
                     alpha,
+                    scale,
                 );
             }
         }
+    }
+
+    /// Draw one cell over pixels that are black or already this cell's
+    /// background: the background fill, then the glyph or block element,
+    /// all clipped to the cell.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_cell(
+        &mut self,
+        pixels: &mut [u8],
+        width: i32,
+        height: i32,
+        cell: Cell,
+        x: i32,
+        y: i32,
+        cell_width: i32,
+        cell_height: i32,
+        alpha: u8,
+        scale: i32,
+    ) {
+        if cell.bg != [0; 3] {
+            fill_rect(
+                pixels,
+                width,
+                height,
+                x,
+                y,
+                cell_width,
+                cell_height,
+                cell.bg,
+                alpha,
+            );
+        }
+        if cell.ch == ' ' || cell.ch == '\0' {
+            return;
+        }
+        if let Some(block) = block_element(cell.ch) {
+            draw_block(
+                pixels,
+                width,
+                height,
+                x,
+                y,
+                cell_width,
+                cell_height,
+                block,
+                cell.fg,
+                cell.bg,
+                alpha,
+            );
+            return;
+        }
+        let key = (cell.ch, scale);
+        let font = &self.font;
+        let glyph = self.glyphs.entry(key).or_insert_with(|| {
+            let (metrics, coverage) = font.rasterize(cell.ch, FONT_PX * scale as f32);
+            Glyph { metrics, coverage }
+        });
+        let glyph_x = x + glyph.metrics.xmin;
+        let baseline = y + self.ascent * scale;
+        let glyph_y = baseline - glyph.metrics.ymin - glyph.metrics.height as i32;
+        draw_glyph(
+            pixels,
+            width,
+            height,
+            glyph_x,
+            glyph_y,
+            x,
+            y,
+            cell_width,
+            cell_height,
+            glyph,
+            cell.fg,
+            cell.bg,
+            alpha,
+        );
     }
 }
 fn resolve_monospace_font() -> Result<PathBuf> {
@@ -485,6 +551,201 @@ fn multiply(color: u8, alpha: u8) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Drive `render_delta` through `frames` and check after every frame that
+    /// the incremental pixels equal a fresh full render, and that the damage
+    /// rectangle is the changed cells' bounding box (`None` when unchanged).
+    fn check_delta_against_full(
+        rasterizer: &mut Rasterizer,
+        frames: &[Vec<Cell>],
+        cols: i32,
+        rows: i32,
+        scale: i32,
+    ) {
+        // A surface with margins on every side, like a real output.
+        let width = cols * rasterizer.cell_width * scale + 7;
+        let height = rows * rasterizer.cell_height * scale + 5;
+        let size = (width * height * 4) as usize;
+        let mut pixels = vec![0u8; size];
+        rasterizer
+            .render(&mut pixels, width, height, &frames[0], cols, rows, scale)
+            .unwrap();
+        let mut previous = frames[0].clone();
+        for (index, cells) in frames.iter().enumerate().skip(1) {
+            let damage = rasterizer
+                .render_delta(
+                    &mut pixels,
+                    width,
+                    height,
+                    cells,
+                    &previous,
+                    cols,
+                    rows,
+                    scale,
+                )
+                .unwrap();
+            let mut oracle = vec![0u8; size];
+            rasterizer
+                .render(&mut oracle, width, height, cells, cols, rows, scale)
+                .unwrap();
+            assert!(
+                pixels == oracle,
+                "frame {index} (scale {scale}): incremental raster differs from a full render"
+            );
+            let changed: Vec<usize> = (0..cells.len())
+                .filter(|&i| cells[i] != previous[i])
+                .collect();
+            if changed.is_empty() {
+                assert_eq!(damage, None, "frame {index}: no change, no damage");
+            } else {
+                let (cw, ch) = (
+                    rasterizer.cell_width * scale,
+                    rasterizer.cell_height * scale,
+                );
+                let (ox, oy) = ((width - cols * cw) / 2, (height - rows * ch) / 2);
+                let col = |i: usize| i as i32 % cols;
+                let row = |i: usize| i as i32 / cols;
+                let (c0, c1) = (
+                    changed.iter().map(|&i| col(i)).min().unwrap(),
+                    changed.iter().map(|&i| col(i)).max().unwrap() + 1,
+                );
+                let (r0, r1) = (
+                    changed.iter().map(|&i| row(i)).min().unwrap(),
+                    changed.iter().map(|&i| row(i)).max().unwrap() + 1,
+                );
+                let expected = Damage {
+                    x: ox + c0 * cw,
+                    y: oy + r0 * ch,
+                    width: (c1 - c0) * cw,
+                    height: (r1 - r0) * ch,
+                };
+                assert_eq!(
+                    damage,
+                    Some(expected),
+                    "frame {index}: damage is the changed-cell bounding box"
+                );
+            }
+            previous = cells.clone();
+        }
+    }
+
+    fn cell(ch: char, fg: [u8; 3], bg: [u8; 3]) -> Cell {
+        Cell { ch, fg, bg }
+    }
+
+    #[test]
+    fn delta_matches_full_render_for_each_transition() {
+        let Ok(mut rasterizer) = Rasterizer::load() else {
+            eprintln!("no monospace font; skipping");
+            return;
+        };
+        let (fg, bg, black) = ([230, 200, 90], [30, 60, 120], [0, 0, 0]);
+        // A 3x2 grid; cell 1 walks through the transitions, the rest change too.
+        let steps: Vec<[Cell; 6]> = vec![
+            [
+                cell('A', fg, black),
+                cell('g', fg, bg),
+                cell(' ', fg, black),
+                cell('▀', fg, bg),
+                cell('█', fg, black),
+                cell('M', fg, bg),
+            ],
+            // text on a background -> block element
+            [
+                cell('A', fg, black),
+                cell('▀', fg, bg),
+                cell(' ', fg, black),
+                cell('▀', fg, bg),
+                cell('█', fg, black),
+                cell('M', fg, bg),
+            ],
+            // block on a background -> text on black (needs the cell cleared)
+            [
+                cell('A', fg, black),
+                cell('g', fg, black),
+                cell(' ', fg, black),
+                cell('▄', bg, fg),
+                cell('█', fg, black),
+                cell('M', fg, bg),
+            ],
+            // text -> blank on black, block -> blank with a background
+            [
+                cell(' ', fg, black),
+                cell(' ', fg, black),
+                cell('@', fg, bg),
+                cell(' ', fg, bg),
+                cell('▚', fg, bg),
+                cell('M', fg, bg),
+            ],
+            // blank with a background -> NUL on black; shade; unchanged frame next
+            [
+                cell(' ', fg, black),
+                cell('\0', fg, black),
+                cell('@', fg, bg),
+                cell('▒', fg, bg),
+                cell('▚', fg, bg),
+                cell('M', fg, black),
+            ],
+            [
+                cell(' ', fg, black),
+                cell('\0', fg, black),
+                cell('@', fg, bg),
+                cell('▒', fg, bg),
+                cell('▚', fg, bg),
+                cell('M', fg, black),
+            ],
+            // everything black and blank
+            [cell(' ', black, black); 6],
+        ];
+        let frames: Vec<Vec<Cell>> = steps.iter().map(|s| s.to_vec()).collect();
+        for scale in [1, 2] {
+            check_delta_against_full(&mut rasterizer, &frames, 3, 2, scale);
+        }
+    }
+
+    #[test]
+    fn delta_matches_full_render_for_random_frames() {
+        let Ok(mut rasterizer) = Rasterizer::load() else {
+            eprintln!("no monospace font; skipping");
+            return;
+        };
+        let chars = [
+            'a', 'M', 'g', '@', '|', ' ', '\0', '▀', '▄', '█', '▌', '▐', '░', '▓', '▚', '▟', '─',
+        ];
+        let colours = [
+            [0, 0, 0],
+            [255, 255, 255],
+            [30, 60, 120],
+            [200, 40, 10],
+            [0, 0, 1],
+        ];
+        let mut state = 0x2545F4914F6CDD1Du64;
+        let mut next = |n: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % n as u64) as usize
+        };
+        let (cols, rows) = (6, 4);
+        let mut frames = vec![vec![Cell::default(); (cols * rows) as usize]];
+        for _ in 0..200 {
+            let mut cells = frames.last().unwrap().clone();
+            // Change a random subset: sometimes none, sometimes one, sometimes many.
+            let changes = [0, 1, 3, 24][next(4)];
+            for _ in 0..changes {
+                let i = next(cells.len());
+                cells[i] = cell(
+                    chars[next(chars.len())],
+                    colours[next(colours.len())],
+                    colours[next(colours.len())],
+                );
+            }
+            frames.push(cells);
+        }
+        for scale in [1, 2] {
+            check_delta_against_full(&mut rasterizer, &frames, cols, rows, scale);
+        }
+    }
 
     #[test]
     fn stacked_full_blocks_leave_no_seam() {
