@@ -17,6 +17,10 @@ wayland-client = "0.31"
 name = "render"
 harness = false
 
+[[bench]]
+name = "timeline"
+harness = false
+
 
 [profile.release]
 codegen-units = 1
