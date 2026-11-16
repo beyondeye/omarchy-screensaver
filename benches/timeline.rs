@@ -9,6 +9,7 @@
 //!   SSAVER_BENCH_SECONDS         how long to play, in seconds of 120 Hz ticks (default 10)
 //!   SSAVER_BENCH_SEED            seed (default 1; "entropy" = no seed, as in production)
 //!   SSAVER_BENCH_WINDOW_SECONDS  window for the appearance-growth figure (default 64)
+//!   SSAVER_BENCH_TEXT            file with the text to play (default assets/screensaver.txt)
 //!
 //! It plays for exactly the given duration: when the effect ends, the overlay's
 //! own rebuild happens inside `advance_deferred`, and that tick is measured too.
@@ -164,8 +165,12 @@ fn main() {
         ..Options::default()
     };
     let baseline = live_bytes();
+    let text = match std::env::var("SSAVER_BENCH_TEXT") {
+        Ok(path) => std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("SSAVER_BENCH_TEXT {path}: {e}")),
+        Err(_) => include_str!("../assets/screensaver.txt").to_owned(),
+    };
     let mut animation = match Animation::new(
-        include_str!("../assets/screensaver.txt").to_owned(),
+        text,
         options,
         cols,
         rows,
